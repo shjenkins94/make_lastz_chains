@@ -93,7 +93,7 @@ sub usage {
 	print "Automates UCSC's lastz/chain pipeline, including RepeatFiller and chainCleaner.";
 
 print "
-    -clusterRunDir dir    Optional: Full path to a directory ƒthat will hold all temporary files and steps during the cluster run (default current directory).
+    -clusterRunDir dir    Optional: Full path to a directory that will hold all temporary files and steps during the cluster run (default current directory).
     -keepTempFiles        Optional flag: If set, do not cleanup the temporary files
     -chainMinScore n      Specify minimum score for a chain in axtChain (default: $chainMinScore)
     -chainLinearGap type  Specify gap costs used in axtChain (can be loose|medium|filename. default: loose)
@@ -224,8 +224,6 @@ sub requireNum {
 ##################################################################################################################################################
 
 
-
-
 ##############################################################################################################################################
 # Make sure %defVars contains what we need and looks consistent with our assumptions.
 ##############################################################################################################################################
@@ -300,7 +298,87 @@ sub testCleanState {
 
 
 ##############################################################################################################################################
+# Three small helper functions for creating UGE jobscript files
+##############################################################################################################################################
+sub convMbToGb {
+	my ($mbSize) = shift(@_);
+
+	if ($mbSize <= 4000) {
+		return 4;
+		}
+		else {
+			return sprintf('%.0f', $mbSize / 1000);
+		}		
+}
+
+sub writeJobscript {
+	my ($filename, $jobname, $memMb, $call) = @_;
+
+	# Get memory in GB
+	my $memGb = convMbToGb($memMb);
+	
+	# Create jobscript file
+	my $fh = &HgAutomate::mustOpen(">$filename");
+
+	# Create uge jobscript
+	print $fh  <<_EOF_
+#!/usr/bin/env bash
+#\$ -cwd
+#\$ -S /bin/bash
+#\$ -V
+#\$ -sync y
+#\$ -l s_vmem=${memGb}G
+#\$ -l mem_req=${memGb}G
+#\$ -o ${jobname}_$tDb$qDb.o
+#\$ -e ${jobname}_$tDb$qDb.e
+#\$ -N ${jobname}_$tDb$qDb 
+
+$call
+
+_EOF_
+;
+	close($fh);
+
+	return $fh;
+}
+
+sub writeArrayJobscript {
+	my ($filename, $jobname, $memMb, $jobList) = @_;
+
+	# Get memory in GB
+	my $memGb = convMbToGb($memMb);
+
+	# Create jobscript file
+	my $fh = &HgAutomate::mustOpen(">$filename");
+
+	# Create uge jobscript
+	print $fh  <<_EOF_
+#!/usr/bin/env bash
+#\$ -cwd
+#\$ -S /bin/bash
+#\$ -V
+#\$ -sync y
+#\$ -t 1-\$TASK_NUM
+#\$ -tc 50
+#\$ -l s_vmem=${memGb}G
+#\$ -l mem_req=${memGb}G
+#\$ -o ${jobname}.o
+#\$ -e ${jobname}.e
+#\$ -N ${jobname}
+
+sed -n \${SGE_TASK_ID}p $jobList | bash
+
+_EOF_
+;
+	close($fh);
+
+	return $fh;
+}
+
+
+##############################################################################################################################################
 # Partition the sequence up before lastz.
+# Can run on local I think.
 ##############################################################################################################################################
 sub doPartition {
 	&HgAutomate::verbose(1, "doPartition ....\n");
@@ -404,12 +482,15 @@ sub doLastzClusterRun {
 	testCleanState("doLastzClusterRun", $runDir, "$runDir/lastz.done", "doPartition", "$runDir/partition.done");
 
 	my $checkOutExists ="$outRoot" . '/$(file1)/$(file1)_$(file2).psl';
-	# my $templateCmd = "$blastzRunUcsc -outFormat psl \$(path1) \$(path2) ../DEF " . $checkOutExists;
+	
+	# Template command for gsub
 	my $templateCmd = "$blastzRunUcsc --outFormat psl \$(path1) \$(path2) $buildDir/DEF " . $checkOutExists;
 	&HgAutomate::makeGsub($runDir, $templateCmd);
 
-	my $myParaRun = "
-parallel_executor.py lastz_$tDb$qDb jobList -q day --memoryMb 10000  -e $nf_executor --co \"$clusterOptions\" -p $cluster_partition --eq $queueSize\n";
+	# Create uge jobscript
+	my $ugeFh = &writeArrayJobscript("$runDir/uge-jobscript", "lastz_$tDb$qDb", 10000, "jobList");
+
+	my $myParaRun = "qsub_beta uge-jobscript";
 
 	my $whatItDoes = "Set up and perform the all-vs-all lastz cluster run.";
   
@@ -417,6 +498,8 @@ parallel_executor.py lastz_$tDb$qDb jobList -q day --memoryMb 10000  -e $nf_exec
 ## Never indent the content of the add() function!
 	$bossScript->add(<<_EOF_
 $HgAutomate::gensub2 $targetList $queryList gsub jobList
+TASK_NUM=\$(wc -l < jobList)
+sed -i 's/\$TASK_NUM/'\$TASK_NUM'/g' uge-jobscript
 $myParaRun
 _EOF_
     );
@@ -446,15 +529,19 @@ sub doCatRun {
 	&HgAutomate::mustMkdir($runDir);
 	&HgAutomate::makeGsub($runDir, "pyCat.py $outRoot/\$(path1) $checkOutExists");
 
-	my $myParaRun = "
-parallel_executor.py catRun_$tDb$qDb jobList -q day --memoryMb 4000 -e $nf_executor --co \"$clusterOptions\" -p $cluster_partition --eq $queueSize\n";
+	# Create uge jobscript
+	my $ugeFh = &writeArrayJobscript("$runDir/uge-jobscript", "cat_$tDb$qDb", 4000, "jobList");
 
+	my $myParaRun = "qsub_beta uge-jobscript";
+	
 	my $whatItDoes = "Sets up and perform a cluster run to concatenate all files in each subdirectory of $outRoot into a per-target-chunk file.";
 	my $bossScript = new HgRemoteScript("$runDir/doCatRun.csh", "", $runDir, $whatItDoes, $DEF);
 	$bossScript->add(<<_EOF_
 (cd $outRoot; find . -maxdepth 1 -type d | grep '^./') | sed -e 's#/\$##; s#^./##' > tParts.lst
 
 $HgAutomate::gensub2 tParts.lst single gsub jobList
+TASK_NUM=\$(wc -l < jobList)
+sed -i 's/\$TASK_NUM/'\$TASK_NUM'/g' uge-jobscript
 mkdir -p ../TEMP_pslParts
 $myParaRun
 _EOF_
@@ -527,7 +614,6 @@ sub doChainRun {
 	&HgAutomate::verbose(1, "made $runDir\n");
  
 	my $checkOutExists = "$runDir/chain/\$(file1).chain";
-	&HgAutomate::makeGsub($runDir, "$runDir/chain.csh \$(file1) $checkOutExists");
 
 	my $seq1Dir = $defVars{'SEQ1_DIR'};
 	my $seq2Dir = $defVars{'SEQ2_DIR'};
@@ -544,6 +630,8 @@ _EOF_
 ;
 	close($fh);
 
+	&HgAutomate::makeGsub($runDir, "$runDir/chain.csh \$(file1) $checkOutExists");
+
 	# this splits the psls into chroms and bundles them and produces pslParts.lst 
 	if (! $debug) {
 		bundlePslForChaining("$buildDir/TEMP_pslParts", "$runDir/splitPSL", "$runDir/pslParts.lst", 50000000, 1);
@@ -551,14 +639,21 @@ _EOF_
 	# customize the $myparaRun variable depending upon the clusterType: 
 	# request 15 GB of mem for the chaining jobs. Some take more than 5 GB apparently
 
-	my $myParaRun = "
-parallel_executor.py chainRun_$tDb$qDb jobList -q $chainingQueue --memoryMb $chainingMemory -e $nf_executor --co \"$clusterOptions\" -p $cluster_partition --eq $queueSize\n";
+	# Create uge jobscript
+	my $ugeFh = &writeArrayJobscript("$runDir/uge-jobscript", "chainRun_$tDb$qDb", $chainingMemory, "jobList");
+
+	my $myParaRun = "qsub_beta uge-jobscript";
+
+# 	my $myParaRun = "
+# parallel_executor.py chainRun_$tDb$qDb jobList -q $chainingQueue --memoryMb $chainingMemory -e $nf_executor --co \"$clusterOptions\" -p $cluster_partition --eq $queueSize\n";
 	
 	my $whatItDoes = "Set up and perform cluster run to chain all co-linear local alignments.";
 	my $bossScript = new HgRemoteScript("$runDir/doChainRun.csh", "", $runDir, $whatItDoes, $DEF);
 	$bossScript->add(<<_EOF_
 chmod a+x chain.csh
 $HgAutomate::gensub2 pslParts.lst single gsub jobList
+TASK_NUM=\$(wc -l < jobList)
+sed -i 's/\$TASK_NUM/'\$TASK_NUM'/g' uge-jobscript
 mkdir -p chain
 $myParaRun
 
@@ -586,12 +681,21 @@ sub doChainMerge {
 	testCleanState("doChainMerge", $runDir, "$runDir/chainMerge.done", "doChainRun", "$buildDir/TEMP_axtChain/run/chain.done");
 
 	my $call="find $runDir/run/chain -name \"*.chain\" | $chainMergeSort -inputList=stdin | gzip -c > $outputChain";
-	&HgAutomate::verbose(1, "$call\n");
-	if (! $debug) {
-		system("$call") == 0 || die("ERROR: $call failed\n");
-	}
-	&HgAutomate::verbose(1, "doChainMerge DONE\n");
+
+	my $ugeFh = &writeJobscript("$runDir/uge-jobscript", "chainMerge_$tDb$qDb", 4000, $call);
+
+	my $myParaRun = "qsub_beta $runDir/uge-jobscript";
+
+	my $whatItDoes = "Set up and perform cluster run to merge chains.";
+	my $bossScript = new HgRemoteScript("$runDir/doMergeChain.csh", "", $runDir, $whatItDoes, $DEF);
+	$bossScript->add(<<_EOF_
+$myParaRun
+_EOF_
+  );
+
+	$bossScript->execute() if (! $debug);
 	`touch $runDir/chainMerge.done`;
+	&HgAutomate::verbose(1, "doChainMerge DONE\n");
 }	# sub doChainMerge {}
 
 
@@ -627,7 +731,16 @@ sub doFillChains {
 	my $jobsDir = "$runDir/jobs";
 	&HgAutomate::mustMkdir($jobsDir);
 
+	my $fillPrepMemory = $defVars{'FILL_PREPARE_MEMORY'};
+	my $fillChainMemory = $defVars{'FILL_MEMORY'};
+
 	## process RepeatFiller parameters
+	my $param = "";
+	$param .= " --chainMinScore $defVars{'FILL_CHAIN_MINSCORE'} --gapMaxSizeT $defVars{'FILL_GAPMAXSIZE_T'} --gapMaxSizeQ $defVars{'FILL_GAPMAXSIZE_Q'}";
+	$param .= " --scoreThreshold $defVars{'FILL_INSERTCHAIN_MINSCORE'}" if (defined($defVars{'FILL_INSERTCHAIN_MINSCORE'}));
+	$param .= " --gapMinSizeT $defVars{'FILL_GAPMINSIZE_T'} --gapMinSizeQ $defVars{'FILL_GAPMINSIZE_Q'}";
+	$param .= " --unmask" if ($fillUnmask == 1);
+
 	my $lastzParameters = "K=$defVars{'FILL_BLASTZ_K'} L=$defVars{'FILL_BLASTZ_L'}";
 	$lastzParameters .= " W=$defVars{'FILL_BLASTZ_W'}" if (defined($defVars{'FILL_BLASTZ_W'}));
 	$lastzParameters .= " Q=$defVars{'FILL_BLASTZ_Q'}" if (defined($defVars{'FILL_BLASTZ_Q'}));
@@ -637,75 +750,43 @@ sub doFillChains {
 	my $scoreChainParameters = "";
 	$scoreChainParameters .= " -scoreScheme=$defVars{'FILL_BLASTZ_Q'}" if (defined($defVars{'FILL_BLASTZ_Q'}));
 
-	### specify chain, index, and 2bit file paths during cluster run
-	my $param = "";
-	$param .= " --chainMinScore $defVars{'FILL_CHAIN_MINSCORE'} --gapMaxSizeT $defVars{'FILL_GAPMAXSIZE_T'} --gapMaxSizeQ $defVars{'FILL_GAPMAXSIZE_Q'}";
-	$param .= " --scoreThreshold $defVars{'FILL_INSERTCHAIN_MINSCORE'}" if (defined($defVars{'FILL_INSERTCHAIN_MINSCORE'}));
-	$param .= " --gapMinSizeT $defVars{'FILL_GAPMINSIZE_T'} --gapMinSizeQ $defVars{'FILL_GAPMINSIZE_Q'}";
-	$param .= " --unmask" if ($fillUnmask == 1);
+	my $templateCmd = "$RepeatFiller --workdir $runDir --chainExtractID $chainExtractID --lastz $lastz --axtChain $axtChain --chainSort $chainSort ";
+	$templateCmd .= "-c \$(path1) -T2 $defVars{'SEQ1_DIR'} -Q2 $defVars{'SEQ2_DIR'} ";
+	$templateCmd .= "--lastzParameters \" $lastzParameters \" $param | ";
+	$templateCmd .= "$scoreChain -linearGap=$chainLinearGap $scoreChainParameters stdin $defVars{'SEQ1_DIR'} $defVars{'SEQ2_DIR'} stdout | ";
+	$templateCmd .= "$chainSort stdin $filledDir/\$(root1).chain";
 
-	my $fillChainMemory = $defVars{'FILL_MEMORY'};
-	my $fillPrepMemory = $defVars{'FILL_PREPARE_MEMORY'};
+	&HgAutomate::makeGsub($runDir, $templateCmd);
+
+	# write job preparation script
+    my $prepareCall = <<EOF;
+set -eo pipefail
+zcat $inputChain > $runDir/all.chain
+# create jobs
+$splitChain_into_randomParts -c $runDir/all.chain -n $numFillJobs -p $jobsDir/fillChain_
+ls -1 $jobsDir/fillChain_* > $runDir/chainList.txt
+EOF
+
+	my $ugeFh = &writeJobscript("$runDir/uge-prep-jobscript", "preparefill_$tDb$qDb", $fillPrepMemory, $prepareCall);
+
+	my $paraRunPrep = "qsub_beta uge-prep-jobscript";
 	
-	#### --- set up para calls
+	$ugeFh = &writeArrayJobscript("$runDir/uge-fill-jobscript", "fill_$tDb$qDb", $fillChainMemory, "jobList");
 
 	# para fill chain (major part of step)
-	my $paraRun = "parallel_executor.py fillChain_$tDb$qDb jobList.txt -q medium --memoryMb $fillChainMemory  -e $nf_executor --co \"$clusterOptions\" -p $cluster_partition --eq $queueSize\n";
+	my $paraRun = "qsub_beta uge-fill-jobscript";
 
-	# para prepare chain filling (unzipped and build index)
-	my $jobfprepare = "$runDir/jobList_prepare.txt";
-	my $prepareScript = "$runDir/fillPrepare.sh";
-	my $runFillScript = "$runDir/runRepeatFiller.sh";
-	my $paraRunPrep = "parallel_executor.py $runDir/fillPrepare_$tDb$qDb $jobfprepare -q medium --memoryMb $fillPrepMemory --maxNumResubmission 1 -e $nf_executor --co \"$clusterOptions\" -p $cluster_partition --eq $queueSize\n";
+	my $mergeCall = <<EOF;
+set -eo pipefail
+find $filledDir -type f -name \"*.chain\" -print | $chainMergeSort -inputList=stdin | gzip -c > $filledChain.gz
+rm -rf $filledDir
+rm -rf $jobsDir
+rm -f $runDir/all.chain
+EOF
 
-	# para merge chains and gzip
-	my $jobfmerge = "$runDir/jobList_merge.txt";
-	my $mergeScript = "$runDir/fillMerge.sh";
-	# my $paraRunMerge = "para make fillMerge_$tDb$qDb $jobfmerge -q medium -memoryMb $fillChainMemory\n";
+	$ugeFh = &writeJobscript("$runDir/uge-merge-jobscript", "mergefill_$tDb$qDb", $fillChainMemory, $mergeCall);
 
-	my $paraRunMerge = "parallel_executor.py $runDir/fillMerge_$tDb$qDb $jobfmerge -q medium --memoryMb $fillChainMemory -e $nf_executor --co \"$clusterOptions\" -p $cluster_partition --eq $queueSize\n";
-
-
-	## write job preparation script	
-	my $fh;
-	open($fh, ">$prepareScript") || croak "ERROR! Can't write to fillChain prepare job list file '$prepareScript'.";
-	print $fh "#!/bin/bash\nset -e\nset -o pipefail\n";
-	print $fh "zcat $inputChain > $runDir/all.chain\n";
-	# create jobs 
-	print $fh "$splitChain_into_randomParts -c $runDir/all.chain -n $numFillJobs -p $jobsDir/infillChain_\n";
-	print $fh "for f in $jobsDir/infillChain_*\n";
-	print $fh "do\n";
-	print $fh "\techo $runFillScript \$f >> $runDir/jobList.txt\n";
-	print $fh "done\n";
-	close($fh);
-
-	### write script for calling runRepeatFiller on cluster 
-	open($fh, ">$runFillScript") || croak "ERROR! Can't write to RepeatFiller script '$runDir/$runFillScript'.";
-	print $fh "#!/bin/bash\nset -e\nset -o pipefail\n";
-	print $fh "#get variables paths\n";
-	print $fh "chainf=\$1\n";
-	print $fh "rseq=$defVars{'SEQ1_DIR'}\n";
-	print $fh "qseq=$defVars{'SEQ2_DIR'}\n";
-#	print $fh "tdir=`mktemp -d`\n";
-#	print $fh "trap \"echo \\\"cleanup tempdir \$tdir\\\"; rm -rf \$tdir\" EXIT\n";
-	print $fh "tnamechainf=\${chainf##*/in}\n\n";
-	print $fh "#run RepeatFiller\n";
-	print $fh "echo \"..calling RepeatFiller: \"\n";
-#	print $fh "$RepeatFiller --workdir \$tdir --chainExtractID $chainExtractID --lastz $lastz --axtChain $axtChain --chainSort $chainSort -c \$chainf -T2 \$rseq -Q2 \$qseq $param --lastzParameters '$lastzParameters ' | $scoreChain -linearGap=$chainLinearGap $scoreChainParameters stdin \$rseq \$qseq stdout | $chainSort stdin $filledDir/\$tnamechainf.chain\n";
-	print $fh "$RepeatFiller --workdir $runDir --chainExtractID $chainExtractID --lastz $lastz --axtChain $axtChain --chainSort $chainSort -c \$chainf -T2 \$rseq -Q2 \$qseq $param --lastzParameters '$lastzParameters ' | $scoreChain -linearGap=$chainLinearGap $scoreChainParameters stdin \$rseq \$qseq stdout | $chainSort stdin $filledDir/\$tnamechainf.chain\n";
-#	print $fh "echo \"..clean up temp directory: \"\n";
-#	print $fh "rm -rf \$tdir\n";
-	close($fh);
-
-	## write merging script
-	open($fh, ">$mergeScript") || croak "ERROR! Can't write to fillChain merge job list file '$mergeScript'.";
-	print $fh "#!/bin/bash\nset -e\nset -o pipefail\n";
-	print $fh "find $filledDir -type f -name \"*.chain\" -print | $chainMergeSort -inputList=stdin | gzip -c > $filledChain.gz\n";
-	print $fh "rm -r $filledDir\n";
-	print $fh "rm -r $jobsDir\n";
-	# delete the unzipped chain file
-	print $fh "rm -f $runDir/all.chain\n";
-	close($fh);
+	my $paraRunMerge = "qsub_beta uge-merge-jobscript";
 
 	## create boss script that runs all commands
 	my $whatItDoes = "Creates an index for a chain file; sets ups and runs a cluster job for filling gaps in chains and merges chains into new chain.";
@@ -713,17 +794,12 @@ sub doFillChains {
 	
 	#### create boss script
 	$bossScript->add(<<_EOF_
-# create job files and make scripts executable
-# prepare script creates index and all job fills for chainFill jobs
-echo \"$prepareScript\" > $jobfprepare
-chmod 755 $prepareScript
-# merge script merges chains
-echo \"$mergeScript\" > $jobfmerge
-chmod 755 $mergeScript			 
-chmod 755 $runFillScript
-
-### run para
 $paraRunPrep
+
+$HgAutomate::gensub2 chainList.txt single gsub jobList
+
+TASK_NUM=\$(wc -l < jobList)
+sed -i 's/\$TASK_NUM/'\$TASK_NUM'/g' uge-fill-jobscript
 
 $paraRun
 
@@ -735,6 +811,7 @@ _EOF_
 	$bossScript->execute() if (! $debug);
 	`touch $runDir/fillChain.done`;
 	&HgAutomate::verbose(1, "doFillChains DONE\n");
+
 }
 
 
@@ -776,29 +853,26 @@ sub doCleanChains {
 	my $matrix = $defVars{'BLASTZ_Q'} ? "-scoreScheme=$defVars{BLASTZ_Q} " : "";
 	my $linearGap = "-linearGap=$chainLinearGap";
 
-	# request 60 GB
-	my $paraCleanChain = "
-parallel_executor.py cleanChain_$tDb$qDb jobListChainCleaner -q short --memoryMb $chainCleanMemory -e $nf_executor --co \"$clusterOptions\" -p $cluster_partition --eq $queueSize\n";
+	my $call = <<EOF;
+set -eo pipefail
+$chainCleaner $buildDir/TEMP_axtChain/$tDb.$qDb.beforeCleaning.chain.gz $seq1Dir $seq2Dir $outputChain removedSuspects.bed $linearGap $matrix -tSizes=$defVars{SEQ1_LEN} -qSizes=$defVars{SEQ2_LEN} $defVars{'CLEANCHAIN_PARAMETERS'} >& $buildDir/TEMP_axtChain/log.chainCleaner
+gzip $outputChain
+EOF
 
-	open FILE, ">$runDir/jobListChainCleaner" or croak $!;
-	print FILE "./cleanChains.csh\n";
-	close FILE;
+	my $ugeFh = &writeJobscript("$runDir/uge-clean-jobscript", "clean_$tDb$qDb", $chainCleanMemory, $call);
+
+	my $paraCleanChain = "qsub_beta uge-clean-jobscript";
+	# request 60 GB
+# 	my $paraCleanChain = "
+# parallel_executor.py cleanChain_$tDb$qDb jobListChainCleaner -q short --memoryMb $chainCleanMemory -e $nf_executor --co \"$clusterOptions\" -p $cluster_partition --eq $queueSize\n";
 	
 	system "mv ${inputChain} ${buildDir}/TEMP_axtChain/${tDb}.${qDb}.beforeCleaning.chain.gz" || croak "ERROR in chainClean: Cannot mv ${inputChain} ${buildDir}/TEMP_axtChain/${tDb}.${qDb}.beforeCleaning.chain.gz\n";
-
-	my $fh;
-	open($fh, ">$runDir/cleanChains.csh") || croak "ERROR! Can't write to chainClean script file '$runDir/cleanChains.csh'.";
-	print $fh "#!/bin/bash\nset -e\nset -o pipefail\n";
-	print $fh "$chainCleaner $buildDir/TEMP_axtChain/$tDb.$qDb.beforeCleaning.chain.gz $seq1Dir $seq2Dir $outputChain removedSuspects.bed $linearGap $matrix -tSizes=$defVars{SEQ1_LEN} -qSizes=$defVars{SEQ2_LEN} $defVars{'CLEANCHAIN_PARAMETERS'} >& $buildDir/TEMP_axtChain/log.chainCleaner\n";
-	print $fh "gzip $outputChain\n";
-	close($fh);
 
 	my $whatItDoes = "It performs a chainCleaner run on the cluster.";
 	# script that we execute. This pushes the chainCleaner cluster job.
 	my $bossScript = newBash HgRemoteScript("$runDir/doCleanChain.sh", "", $runDir, $whatItDoes, $DEF);
 	$bossScript->add(<<_EOF_
 # clean chain
-chmod a+x cleanChains.csh
 $paraCleanChain
 _EOF_
 	  );
@@ -825,7 +899,7 @@ sub cleanup {
 	my $whatItDoes = "Cleans up files after a successful $0 run.";  # Bogdan: leave quotes
 	my $bossScript = new HgRemoteScript("$buildDir/cleanUp.csh", "", $runDir, $whatItDoes, $DEF);
 	$bossScript->add(<<_EOF_
-rm -fr TEMP_run.lastz/ TEMP_run.cat/ TEMP_run.fillChain/ TEMP_pslParts/ TEMP_axtChain/ TEMP_psl/ cleanUp.csh 
+rm -rf TEMP_run.lastz/ TEMP_run.cat/ TEMP_run.fillChain/ TEMP_pslParts/ TEMP_axtChain/ TEMP_psl/ cleanUp.csh 
 _EOF_
 	);
 
