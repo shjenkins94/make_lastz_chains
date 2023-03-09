@@ -57,7 +57,7 @@ my $chainingQueue = "long";		# queue for chaining jobs (long is default)
 my $chainingMemory = 15000;		# memory limit for chaining jobs in MB
 my $chainCleanMemory = 100000;	# memory limit for chainClean jobs in MB
 
-my $maxNumLastzJobs = 6000;		# number job limit for lastz step
+my $maxNumLastzJobs = 75000;		# number job limit for lastz step
 my $numFillJobs = 1000;		# number of cluster jobs for the fillChain step
 my $nf_executor = "local";  # cluster jobs executor, default local, possible: slurm, lsf, etc
 my $queueSize = 2000;  # maximal num of jobs in the queue
@@ -124,7 +124,6 @@ sub checkOptions {
 		"continue=s" => \$opt_continue,
 		"stop=s" => \$opt_stop,
 		"verbose" => \$opt_verbose,
-		"executor=s" => \$nf_executor,
 		"keepTemp" => \$keep_temp,
 		"queueSize=i" => \$queueSize,
 		"cluster_partition=s" => \$cluster_partition,
@@ -351,6 +350,7 @@ sub writeArrayJobscript {
 	# Create jobscript file
 	my $fh = &HgAutomate::mustOpen(">$filename");
 
+
 	# Create uge jobscript
 	print $fh  <<_EOF_
 #!/usr/bin/env bash
@@ -367,6 +367,59 @@ sub writeArrayJobscript {
 #\$ -N ${jobname}
 
 sed -n \${SGE_TASK_ID}p $jobList | bash
+
+STATUS=\$?
+
+if [[ \$STATUS -eq 0 ]]; then
+	echo \$SGE_TASK_ID >> ${jobList}_success
+fi
+
+exit \$STATUS
+
+_EOF_
+;
+	close($fh);
+
+	return $fh;
+}
+
+sub writeArrayPaJobscript {
+	my ($filename, $jobname, $memMb, $slots, $inc, $jobList) = @_;
+
+	# Get memory in GB
+	my $memGb = convMbToGb($memMb);
+
+	# Create jobscript file
+	my $fh = &HgAutomate::mustOpen(">$filename");
+
+
+	# Create uge jobscript
+	print $fh  <<_EOF_
+#!/usr/bin/env bash
+#\$ -cwd
+#\$ -S /bin/bash
+#\$ -V
+#\$ -sync y
+#\$ -t 1-\$TASK_NUM:$inc
+#\$ -tc 50
+#\$ -pe def_slot ${slots}
+#\$ -l s_vmem=${memGb}G
+#\$ -l mem_req=${memGb}G
+#\$ -o ${jobname}.o
+#\$ -e ${jobname}.e
+#\$ -N ${jobname}
+
+let QUIT_ID=\${SGE_TASK_ID}+$inc
+let END_ID=\${QUIT_ID}-1
+
+sed -n "\${SGE_TASK_ID},\${END_ID}p;\${QUIT_ID}q" $jobList | \
+parallel -j $slots --halt soon,fail=1 --retries 3 "{} && echo {} >> ${jobList}_success"
+
+# # Get 100 numbers starting from SGE_TASK_ID
+# seq \${SGE_TASK_ID} \$((\${SGE_TASK_ID}+99)) | \
+# # parallel do task, echo exit code to file
+# parallel -j $slots --halt soon,fail=1 --retries 3 
+# "sed -n {}p $jobList | bash && echo {} >> ${jobList}_success"
 
 _EOF_
 ;
@@ -488,7 +541,7 @@ sub doLastzClusterRun {
 	&HgAutomate::makeGsub($runDir, $templateCmd);
 
 	# Create uge jobscript
-	my $ugeFh = &writeArrayJobscript("$runDir/uge-jobscript", "lastz_$tDb$qDb", 10000, "jobList");
+	my $ugeFh = &writeArrayPaJobscript("$runDir/uge-jobscript", "lastz_$tDb$qDb", 3000, 4, 100, "jobList");
 
 	my $myParaRun = "qsub_beta uge-jobscript";
 
@@ -643,9 +696,6 @@ _EOF_
 	my $ugeFh = &writeArrayJobscript("$runDir/uge-jobscript", "chainRun_$tDb$qDb", $chainingMemory, "jobList");
 
 	my $myParaRun = "qsub_beta uge-jobscript";
-
-# 	my $myParaRun = "
-# parallel_executor.py chainRun_$tDb$qDb jobList -q $chainingQueue --memoryMb $chainingMemory -e $nf_executor --co \"$clusterOptions\" -p $cluster_partition --eq $queueSize\n";
 	
 	my $whatItDoes = "Set up and perform cluster run to chain all co-linear local alignments.";
 	my $bossScript = new HgRemoteScript("$runDir/doChainRun.csh", "", $runDir, $whatItDoes, $DEF);
