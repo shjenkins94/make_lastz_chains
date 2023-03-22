@@ -334,6 +334,8 @@ sub writeJobscript {
 
 $call
 
+exit \$?
+
 _EOF_
 ;
 	close($fh);
@@ -384,7 +386,7 @@ _EOF_
 }
 
 sub writeArrayPaJobscript {
-	my ($filename, $jobname, $memMb, $slots, $inc, $jobList) = @_;
+	my ($filename, $jobname, $memMb, $slots, $inc, $conc, $jobList) = @_;
 
 	# Get memory in GB
 	my $memGb = convMbToGb($memMb);
@@ -401,25 +403,25 @@ sub writeArrayPaJobscript {
 #\$ -V
 #\$ -sync y
 #\$ -t 1-\$TASK_NUM:$inc
-#\$ -tc 50
+#\$ -tc $conc
 #\$ -pe def_slot ${slots}
 #\$ -l s_vmem=${memGb}G
 #\$ -l mem_req=${memGb}G
+#\$ -l d_rt=518400
+#\$ -l s_rt=518400
 #\$ -o ${jobname}.o
 #\$ -e ${jobname}.e
 #\$ -N ${jobname}
+
+mkdir -p pa_logs
 
 let QUIT_ID=\${SGE_TASK_ID}+$inc
 let END_ID=\${QUIT_ID}-1
 
 sed -n "\${SGE_TASK_ID},\${END_ID}p;\${QUIT_ID}q" $jobList | \
-parallel -j $slots --halt soon,fail=1 --retries 3 "{} && echo {} >> ${jobList}_success"
+parallel -j $slots --halt soon,fail=1 --retries 3 --joblog pa_logs/${jobname}_\${SGE_TASK_ID}.log
 
-# # Get 100 numbers starting from SGE_TASK_ID
-# seq \${SGE_TASK_ID} \$((\${SGE_TASK_ID}+99)) | \
-# # parallel do task, echo exit code to file
-# parallel -j $slots --halt soon,fail=1 --retries 3 
-# "sed -n {}p $jobList | bash && echo {} >> ${jobList}_success"
+exit \$?
 
 _EOF_
 ;
@@ -541,7 +543,7 @@ sub doLastzClusterRun {
 	&HgAutomate::makeGsub($runDir, $templateCmd);
 
 	# Create uge jobscript
-	my $ugeFh = &writeArrayPaJobscript("$runDir/uge-jobscript", "lastz_$tDb$qDb", 3000, 4, 100, "jobList");
+	my $ugeFh = &writeArrayPaJobscript("$runDir/uge-jobscript", "lastz_$tDb$qDb", 3000, 4, 100, 10, "jobList");
 
 	my $myParaRun = "qsub_beta uge-jobscript";
 
@@ -821,7 +823,7 @@ EOF
 
 	my $paraRunPrep = "qsub_beta uge-prep-jobscript";
 	
-	$ugeFh = &writeArrayJobscript("$runDir/uge-fill-jobscript", "fill_$tDb$qDb", $fillChainMemory, "jobList");
+	$ugeFh = &writeArrayPaJobscript("$runDir/uge-fill-jobscript", "fill_$tDb$qDb", $fillChainMemory, 4, 100, 10, "jobList");
 
 	# para fill chain (major part of step)
 	my $paraRun = "qsub_beta uge-fill-jobscript";
