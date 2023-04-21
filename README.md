@@ -193,6 +193,9 @@ and cmd arg --seq1_chunk equals to 80_000_000
 then the final SEQ1_CHUNK value will be 80_000_000
 because command line arguments have a higher priority.
 
+## TODO
+- [ ] Possibly switch back to runCat.csh
+
 ## Citation
 
 - Kirilenko BM, Munegowda C, Osipova E, Jebb D, Sharma V, Blumer M, Morales A, Ahmed AW, Kontopoulos DG, Hilgers L, Zoonomia Consortium, Hiller M. TOGA integrates gene annotation with orthology inference at scale, submitted

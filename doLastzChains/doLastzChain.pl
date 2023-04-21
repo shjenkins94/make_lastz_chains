@@ -368,15 +368,10 @@ sub writeArrayJobscript {
 #\$ -e ${jobname}.e
 #\$ -N ${jobname}
 
-sed -n \${SGE_TASK_ID}p $jobList | bash
+sed -n \${SGE_TASK_ID}p $jobList | 
+parallel -j 1 --halt soon,fail=1 --retries 3 --joblog +${jobList}.log
 
-STATUS=\$?
-
-if [[ \$STATUS -eq 0 ]]; then
-	echo \$SGE_TASK_ID >> ${jobList}_success
-fi
-
-exit \$STATUS
+exit \$?
 
 _EOF_
 ;
@@ -418,7 +413,7 @@ mkdir -p pa_logs
 let QUIT_ID=\${SGE_TASK_ID}+$inc
 let END_ID=\${QUIT_ID}-1
 
-sed -n "\${SGE_TASK_ID},\${END_ID}p;\${QUIT_ID}q" $jobList | \
+sed -n "\${SGE_TASK_ID},\${END_ID}p;\${QUIT_ID}q" $jobList |
 parallel -j $slots --halt soon,fail=1 --retries 3 --joblog pa_logs/${jobname}_\${SGE_TASK_ID}.log
 
 exit \$?
