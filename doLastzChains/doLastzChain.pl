@@ -580,7 +580,7 @@ sub doCatRun {
 	&HgAutomate::makeGsub($runDir, "pyCat.py $outRoot/\$(path1) $checkOutExists");
 
 	# Create uge jobscript
-	my $ugeFh = &writeArrayJobscript("$runDir/uge-jobscript", "cat_$tDb$qDb", 4000, "jobList");
+	my $ugeFh = &writeArrayJobscript("$runDir/uge-jobscript", "cat_$tDb$qDb", 8000, "jobList");
 
 	my $myParaRun = "qsub_beta uge-jobscript";
 	
